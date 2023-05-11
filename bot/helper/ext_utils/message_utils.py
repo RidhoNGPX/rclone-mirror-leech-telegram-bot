@@ -4,7 +4,7 @@
 from asyncio import sleep
 from os import remove
 from time import time
-from bot import LOGGER, bot, Interval, rss_session, config_dict, status_reply_dict_lock, status_reply_dict
+from bot import LOGGER, bot, Interval, rss_session, config_dict, status_reply_dict_lock, status_reply_dict, status_dict_lock
 from pyrogram.errors.exceptions import FloodWait, MessageNotModified
 from pyrogram.enums.parse_mode import ParseMode
 from bot.helper.ext_utils.bot_utils import get_readable_message, setInterval
@@ -12,8 +12,10 @@ from bot.helper.ext_utils.bot_utils import get_readable_message, setInterval
 
 async def sendMessage(text: str, message):
     try:
-        return await bot.send_message(message.chat.id, reply_to_message_id=message.id,
-                            text=text, disable_web_page_preview=True)
+        return await bot.send_message(message.chat.id, 
+                            reply_to_message_id=message.id,
+                            text=text, 
+                            disable_web_page_preview=True)
     except FloodWait as fw:
         await sleep(fw.value)
         return await sendMessage(text, message)
@@ -35,9 +37,9 @@ async def sendMarkup(text: str, message, reply_markup):
 async def editMarkup(text: str, message, reply_markup):
     try:
         return await bot.edit_message_text(message.chat.id,
-                                    message.id,
-                                    text=text, 
-                                    reply_markup=reply_markup)
+                            message.id,
+                            text=text, 
+                            reply_markup=reply_markup)
     except FloodWait as fw:
         await sleep(fw.value)
         return await editMarkup(text, message, reply_markup) 
@@ -48,8 +50,10 @@ async def editMarkup(text: str, message, reply_markup):
 
 async def editMessage(text: str, message, reply_markup=None):
     try:
-        return await bot.edit_message_text(text=text, message_id=message.id,
-                            chat_id=message.chat.id, reply_markup=reply_markup)
+        return await bot.edit_message_text(text=text, 
+                            message_id=message.id,
+                            chat_id=message.chat.id, 
+                            reply_markup=reply_markup)
     except FloodWait as fw:
         await sleep(fw.value)
         return await editMessage(text, message, reply_markup)
@@ -60,7 +64,7 @@ async def editMessage(text: str, message, reply_markup=None):
         return str(e)
 
 async def sendRss(text: str):
-    if rss_session is None:
+    if not rss_session:
         try:
             return await bot.send_message(config_dict['RSS_CHAT_ID'], text, disable_web_page_preview=True)
         except FloodWait as e:
@@ -105,10 +109,10 @@ async def sendFile(message, name: str, caption=""):
 
 async def delete_all_messages():
     async with status_reply_dict_lock:
-        for data in list(status_reply_dict.values()):
+        for key, data in list(status_reply_dict.items()):
             try:
+                del status_reply_dict[key]
                 await deleteMessage(data[0])
-                del status_reply_dict[data[0].chat.id]
             except Exception as e:
                 LOGGER.error(str(e))
 
@@ -116,22 +120,18 @@ async def update_all_messages(force=False):
     async with status_reply_dict_lock:
         if not status_reply_dict or not Interval or (not force and time() - list(status_reply_dict.values())[0][1] < 3):
             return
-        for chat_id in status_reply_dict:
+        for chat_id in list(status_reply_dict.keys()):
             status_reply_dict[chat_id][1] = time()
-
     msg, buttons = await get_readable_message()
     if msg is None:
         return
     async with status_reply_dict_lock:
-        for chat_id in status_reply_dict:
+        for chat_id in list(status_reply_dict.keys()):
             if status_reply_dict[chat_id] and msg != status_reply_dict[chat_id][0].text:
-                if buttons == "":
-                    rmsg = await editMessage(msg, status_reply_dict[chat_id][0])
-                else:
-                    rmsg = await editMessage(msg, status_reply_dict[chat_id][0], buttons)
-                if rmsg == "Message to edit not found":
+                rmsg = await editMessage(msg, status_reply_dict[chat_id][0], buttons)
+                if isinstance(rmsg, str) and rmsg.startswith('Telegram says: [400'):
                     del status_reply_dict[chat_id]
-                    return
+                    continue
                 status_reply_dict[chat_id][0].text = msg
                 status_reply_dict[chat_id][1] = time()
 
@@ -140,23 +140,21 @@ async def sendStatusMessage(msg):
     if progress is None:
         return
     async with status_reply_dict_lock:
-        if msg.chat.id in status_reply_dict:
-            message = status_reply_dict[msg.chat.id][0]
+        chat_id = msg.chat.id
+        if chat_id in list(status_reply_dict.keys()):
+            message = status_reply_dict[chat_id][0]
             await deleteMessage(message)
-            del status_reply_dict[msg.chat.id]
-        if buttons == "":
-            message = await sendMessage(progress, msg)
-        else:
-            message = await sendMarkup(progress, msg, buttons)
-        status_reply_dict[msg.chat.id] = [message, time()]
+            del status_reply_dict[chat_id]
+        message = await sendMarkup(progress, msg, buttons)
+        message.text = progress
+        status_reply_dict[chat_id] = [message, time()]
         if not Interval:
             Interval.append(setInterval(config_dict['STATUS_UPDATE_INTERVAL'], update_all_messages))
 
-async def auto_delete_message(cmd_message, bot_message):
-        await sleep(20)
-        try:
-            # Skip if None is passed meaning we don't want to delete bot or cmd message
+async def auto_delete_message(cmd_message=None, bot_message=None):
+    if config_dict['AUTO_DELETE_MESSAGE_DURATION'] != -1:
+        await sleep(config_dict['AUTO_DELETE_MESSAGE_DURATION'])
+        if cmd_message is not None:
             await deleteMessage(cmd_message)
+        if bot_message is not None:
             await deleteMessage(bot_message)
-        except AttributeError:
-            pass

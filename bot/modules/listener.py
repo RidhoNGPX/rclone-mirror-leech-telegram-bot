@@ -2,17 +2,17 @@ from asyncio import create_subprocess_exec, sleep
 from asyncio.subprocess import PIPE
 from html import escape
 from json import loads
-from os import listdir, path as ospath, remove, walk
-import os
+from os import listdir, path as ospath, remove as osremove, walk
 from re import search
-from bot import DOWNLOAD_DIR, LOGGER, TG_MAX_FILE_SIZE, Interval, status_dict, status_dict_lock, aria2, config_dict
-from subprocess import Popen
+from bot import DOWNLOAD_DIR, LOGGER, LOCAL_MIRROR_PORT, TG_MAX_FILE_SIZE, Interval, status_dict, status_dict_lock, aria2, config_dict
 from pyrogram.enums import ChatType
+from bot.helper.ext_utils.bot_utils import add_index_link, is_archive, is_archive_split, is_first_archive_split
 from bot.helper.ext_utils.exceptions import NotSupportedExtractionArchive
-from bot.helper.ext_utils.human_format import human_readable_bytes
+from bot.helper.ext_utils.human_format import get_readable_file_size, human_readable_bytes
 from bot.helper.ext_utils.message_utils import delete_all_messages, sendMarkup, sendMessage, update_all_messages
-from bot.helper.ext_utils.misc_utils import ButtonMaker, clean_download, clean_target, rename_file, split_file
-from bot.helper.ext_utils.rclone_utils import get_gid
+from bot.helper.ext_utils.button_build import ButtonMaker
+from bot.helper.ext_utils.misc_utils import clean_download, clean_target, split_file
+from bot.helper.ext_utils.rclone_utils import get_drive_link
 from bot.helper.ext_utils.zip_utils import get_base_name, get_path_size
 from bot.helper.mirror_leech_utils.status_utils.tg_upload_status import TgUploadStatus
 from bot.helper.mirror_leech_utils.upload_utils.rclone_upload import RcloneMirror
@@ -24,17 +24,19 @@ from bot.helper.mirror_leech_utils.upload_utils.telegram_uploader import Telegra
 
 
 class MirrorLeechListener:
-    def __init__(self, message, tag, user_id, isZip=False, extract=False, pswd=None, isLeech= False, select=False, seed=False):
+    def __init__(self, message, tag, user_id, isZip=False, isMultiZip= False, extract=False, pswd=None, isLeech= False, select=False, seed=False):
         self.message = message
         self.uid = self.message.id
         self.user_id = user_id
         self.__isZip = isZip
-        self.__extract = extract
+        self.__isMultiZip = isMultiZip
+        self.extract = extract
         self.__pswd = pswd
-        self.__tag = tag
+        self.tag = tag
         self.seed = seed
         self.select = select
         self.dir = f"{DOWNLOAD_DIR}{self.uid}"
+        self.multizip_dir = f"{DOWNLOAD_DIR}{self.user_id}/multizip/"
         self.isPrivate = message.chat.type in [ChatType.PRIVATE, ChatType.GROUP]
         self.__isLeech = isLeech
         self.__suproc = None
@@ -48,13 +50,64 @@ class MirrorLeechListener:
         except:
             pass
 
-    def onDownloadStart(self):
+    async def onDownloadStart(self):
         pass
+        
+    async def onMultiZipComplete(self):
+        async with status_dict_lock:
+            download = status_dict[self.uid]
+            name = str(download.name())
+            gid = download.gid()
+        f_path= self.multizip_dir
+        f_size = get_path_size(f_path)
+        path = f"{f_path}{name}.zip" 
+        async with status_dict_lock:
+            status_dict[self.uid] = ZipStatus(name, f_size, gid, self)
+        LEECH_SPLIT_SIZE = config_dict['LEECH_SPLIT_SIZE']  
+        if self.__pswd is not None:
+            if self.__isLeech and int(f_size) > LEECH_SPLIT_SIZE:
+                cmd = ["7z", f"-v{LEECH_SPLIT_SIZE}b", "a", "-mx=0", f"-p{self.__pswd}", path, f_path]
+                self.__suproc = await create_subprocess_exec(*cmd)
+                LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}.0*')
+            else:
+                LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}')
+                cmd =  ["7z", "a", "-mx=0", f"-p{self.__pswd}", path, f_path]
+                self.__suproc = await create_subprocess_exec(*cmd)
+        elif self.__isLeech and int(f_size) > LEECH_SPLIT_SIZE:
+            LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}.0*')
+            cmd= ["7z", f"-v{LEECH_SPLIT_SIZE}b", "a", "-mx=0", path, f_path]
+            self.__suproc = await create_subprocess_exec(*cmd)
+        else:
+            LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}')
+            cmd= ["7z", "a", "-mx=0", path, f_path]
+            self.__suproc = await create_subprocess_exec(*cmd)
+        await self.__suproc.wait()
+        if self.__suproc.returncode == -9:
+            return
+        for dirpath, _, files in walk(f_path, topdown=False):        
+            for file in files:
+                if search(r'\.part0*1\.rar$|\.7z\.0*1$|\.zip\.0*1$|\.zip$|\.7z$|^.(?!.*\.part\d+\.rar)(?=.*\.rar$)', file) is None:    
+                    del_path = ospath.join(dirpath, file)
+                    try:
+                        osremove(del_path)
+                    except:
+                        return
+        up_dir, up_name = path.rsplit('/', 1)
+        size = get_path_size(up_dir)
+        if self.__isLeech:
+            LOGGER.info(f"Leech Name: {up_name}")
+            tg_up= TelegramUploader(up_dir, up_name, size, self)
+            async with status_dict_lock:
+                status_dict[self.uid] = TgUploadStatus(tg_up, size, gid, self)
+            await update_all_messages()
+            await tg_up.upload()    
+        else:
+            await RcloneMirror(up_dir, up_name, size, self.user_id, self).mirror()
 
     async def onDownloadComplete(self):
         async with status_dict_lock:
             download = status_dict[self.uid]
-            name = str(download.name()).replace('/', '')
+            name = str(download.name())
             gid = download.gid()
         LOGGER.info(f"Download completed: {name}")
         if name == "None" or not ospath.exists(f"{self.dir}/{name}"):
@@ -67,23 +120,27 @@ class MirrorLeechListener:
                 status_dict[self.uid] = ZipStatus(name, f_size, gid, self)
             LEECH_SPLIT_SIZE = config_dict['LEECH_SPLIT_SIZE']    
             if self.__pswd is not None:
-                if int(f_size) > LEECH_SPLIT_SIZE:
+                if self.__isLeech and int(f_size) > LEECH_SPLIT_SIZE:
                     LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}.0*')
-                    self.__suproc = Popen(["7z", f"-v{LEECH_SPLIT_SIZE}b", "a", "-mx=0", f"-p{self.__pswd}", path, f_path])
+                    cmd= ["7z", f"-v{LEECH_SPLIT_SIZE}b", "a", "-mx=0", f"-p{self.__pswd}", path, f_path]
+                    self.__suproc = await create_subprocess_exec(*cmd)
                 else:
                     LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}')
-                    self.__suproc = Popen(["7z", "a", "-mx=0", f"-p{self.__pswd}", path, f_path])
-            elif int(f_size) > LEECH_SPLIT_SIZE:
+                    cmd= ["7z", "a", "-mx=0", f"-p{self.__pswd}", path, f_path]
+                    self.__suproc = await create_subprocess_exec(*cmd)
+            elif self.__isLeech and int(f_size) > LEECH_SPLIT_SIZE:
                 LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}.0*')
-                self.__suproc = Popen(["7z", f"-v{LEECH_SPLIT_SIZE}b", "a", "-mx=0", path, f_path])
+                cmd= ["7z", f"-v{LEECH_SPLIT_SIZE}b", "a", "-mx=0", path, f_path]
+                self.__suproc = await create_subprocess_exec(*cmd)
             else:
                 LOGGER.info(f'Zip: orig_path: {f_path}, zip_path: {path}')
-                self.__suproc = Popen(["7z", "a", "-mx=0", path, f_path])
-            self.__suproc.wait()
+                cmd= ["7z", "a", "-mx=0", path, f_path]
+                self.__suproc = await create_subprocess_exec(*cmd)
+            await self.__suproc.wait()
             if self.__suproc.returncode == -9:
                 return
-            clean_target(f_path)
-        elif self.__extract:
+            await clean_target(f_path)
+        elif self.extract:
             try:
                 if ospath.isfile(f_path):
                     path = get_base_name(f_path)
@@ -94,38 +151,41 @@ class MirrorLeechListener:
                     path = f_path    
                     for dirpath, _, files in walk(f_path, topdown=False):
                         for file in files:
-                            if search(r'\.part0*1\.rar$|\.7z\.0*1$|\.zip\.0*1$|\.zip$|\.7z$|^.(?!.*\.part\d+\.rar)(?=.*\.rar$)', file):
+                            if is_first_archive_split(file) or is_archive(file) and not file.endswith('.rar'):
                                 t_path = ospath.join(dirpath, file)
                                 if self.__pswd is not None:
-                                    self.__suproc = Popen(["7z", "x", f"-p{self.__pswd}", t_path, f"-o{dirpath}", "-aot"])
+                                    cmd= ["7z", "x", f"-p{self.__pswd}", t_path, f"-o{dirpath}", "-aot"]
                                 else:
-                                    self.__suproc = Popen(["7z", "x", t_path, f"-o{dirpath}", "-aot"])
-                                    self.__suproc.wait()
+                                    cmd= ["7z", "x", t_path, f"-o{dirpath}", "-aot"]
+                                self.__suproc = await create_subprocess_exec(*cmd)
+                                await self.__suproc.wait()
                                 if self.__suproc.returncode == -9:
                                     return
                                 elif self.__suproc.returncode != 0:
                                     LOGGER.error('Unable to extract archive splits!')
                         if self.__suproc is not None and self.__suproc.returncode == 0:
                             for file in files:
-                                if search(r'\.r\d+$|\.7z\.\d+$|\.z\d+$|\.zip\.\d+$|\.zip$|\.rar$|\.7z$', file):
+                                if is_archive_split(file) or is_archive(file):
                                     del_path = ospath.join(dirpath, file)
                                     try:
-                                        remove(del_path)
+                                        osremove(del_path)
                                     except:
                                         return
                 else:
                     path = self.dir
                     if self.__pswd is not None:
-                        self.__suproc = Popen(["7z", "x", f"-p{self.__pswd}", f_path, f"-o{path}", "-aot"])
+                        cmd= ["7z", "x", f"-p{self.__pswd}", f_path, f"-o{path}", "-aot", "-xr!@PaxHeader"]
                     else:
-                        self.__suproc = Popen(["7z", "x", f_path, f"-o{path}", "-aot"])
-                    self.__suproc.wait()
+                        cmd= ["7z", "x", f_path, f"-o{path}", "-aot", "-xr!@PaxHeader"]
+                    self.__suproc = await create_subprocess_exec(*cmd)
+                    await self.__suproc.wait()
                     if self.__suproc.returncode == -9:
                         return
                     elif self.__suproc.returncode == 0:
                         LOGGER.info(f"Extracted Path: {path}")
+                        path= f_path 
                         try:
-                            os.remove(f_path)
+                            osremove(f_path)
                         except:
                             return
                     else:
@@ -137,13 +197,14 @@ class MirrorLeechListener:
         else:
             path= f_path 
         up_dir, up_name = path.rsplit('/', 1)
+        size = get_path_size(up_dir)
         if self.__isLeech:
             m_size = []
             o_files = []
             if not self.__isZip:
                 checked = False
                 LEECH_SPLIT_SIZE = config_dict['LEECH_SPLIT_SIZE']
-                for dirpath, subdir, files in walk(up_dir, topdown=False):
+                for dirpath, _, files in walk(up_dir, topdown=False):
                     for file_ in files:
                         f_path = ospath.join(dirpath, file_)
                         f_size = ospath.getsize(f_path)
@@ -153,7 +214,7 @@ class MirrorLeechListener:
                                 async with status_dict_lock:
                                     status_dict[self.uid] = SplitStatus(up_name, f_size, gid, self)
                                 LOGGER.info(f"Splitting: {up_name}")
-                            res = split_file(f_path, f_size, file_, dirpath, LEECH_SPLIT_SIZE, self)
+                            res = await split_file(f_path, f_size, file_, dirpath, LEECH_SPLIT_SIZE, self)
                             if not res:
                                 return
                             if res == "errored":
@@ -161,13 +222,12 @@ class MirrorLeechListener:
                                     continue
                                 else:
                                     try:
-                                        os.remove(f_path)
+                                        osremove(f_path)
                                     except:
                                         return
                             elif res != "errored":
                                 m_size.append(f_size)
                                 o_files.append(file_)
-            size = get_path_size(up_dir)
             for s in m_size:
                 size = size - s
             LOGGER.info(f"Leech Name: {up_name}")
@@ -177,13 +237,31 @@ class MirrorLeechListener:
             await update_all_messages()
             await tg_up.upload()    
         else:
-            size = get_path_size(up_dir)
-            rc_mirror = RcloneMirror(up_dir, up_name, size, self.user_id, self)
-            await rc_mirror.mirror()
+            if config_dict['LOCAL_MIRROR']:
+                if LOCAL_MIRROR_URL:= config_dict['LOCAL_MIRROR_URL']:
+                    buttons= ButtonMaker()
+                    server_url = f'{LOCAL_MIRROR_URL}:{LOCAL_MIRROR_PORT}/downloads/'
+                    buttons.url_buildbutton("🖥 Local Server", server_url)
+                    size = get_readable_file_size(size)
+                    msg = f"<b>Name: </b><code>{escape(name)}</code>\n\n<b>Size: </b>{size}"
+                    msg += f'\n<b>cc: </b>{self.tag}\n\n'
+                    await sendMarkup(msg, self.message, reply_markup= buttons.build_menu(1))
+                    async with status_dict_lock:
+                        try:
+                            del status_dict[self.uid]
+                        except Exception as e:
+                            LOGGER.error(str(e))
+                        count = len(status_dict)
+                    if count == 0:
+                        await self.clean()
+                    else:
+                        await update_all_messages()
+            else:
+                await RcloneMirror(up_dir, up_name, size, self.user_id, self).mirror()
 
-    async def onRcloneCopyComplete(self, conf, origin_dir, dest_drive, dest_dir):
+    async def onRcloneCopyComplete(self, conf, origin_dir, dest_remote, dest_dir):
         #Calculate Size
-        cmd = ["rclone", "size", f'--config={conf}', "--json", f"{dest_drive}:{dest_dir}{origin_dir}"]
+        cmd = ["rclone", "size", f'--config={conf}', "--json", f"{dest_remote}:{dest_dir}{origin_dir}"]
         process = await create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
         out, err = await process.communicate()
         output = out.decode().strip()
@@ -195,9 +273,9 @@ class MirrorLeechListener:
         size = human_readable_bytes(data["bytes"])
         format_out = f"**Total Files** {files}" 
         format_out += f"\n**Total Size**: {size}"
-        format_out += f"\n<b>cc: </b>{self.__tag}"
+        format_out += f"\n<b>cc: </b>{self.tag}"
         #Get Link
-        cmd = ["rclone", "link", f'--config={conf}', f"{dest_drive}:{dest_dir}{origin_dir}"]
+        cmd = ["rclone", "link", f'--config={conf}', f"{dest_remote}:{dest_dir}{origin_dir}"]
         process = await create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
         out, err = await process.communicate()
         url = out.decode().strip()
@@ -209,7 +287,7 @@ class MirrorLeechListener:
         else:
             LOGGER.info(err.decode().strip())
             await sendMessage(format_out, self.message)
-        clean_download(self.dir)
+        await clean_download(self.dir)
         async with status_dict_lock:
             try:
                 del status_dict[self.uid]
@@ -221,32 +299,46 @@ class MirrorLeechListener:
         else:
             await update_all_messages()
 
-    async def onRcloneUploadComplete(self, name, size, conf, drive, base, isGdrive):
+    async def onRcloneSyncComplete(self, msg):
+        await sendMessage(msg, self.message)
+        await clean_download(self.dir)
+        async with status_dict_lock:
+            try:
+                del status_dict[self.uid]
+            except Exception as e:
+                LOGGER.error(str(e))
+            count = len(status_dict)
+        if count == 0:
+            await self.clean()
+        else:
+            await update_all_messages()
+
+    async def onRcloneUploadComplete(self, name, size, conf, remote, base, type, isGdrive):
         msg = f"<b>Name: </b><code>{escape(name)}</code>\n\n<b>Size: </b>{size}"
-        button= ButtonMaker()
-        if self.__extract:
+        msg += f'\n<b>cc: </b>{self.tag}\n\n'
+        buttons= ButtonMaker()
+        cmd = ["rclone", "link", f'--config={conf}', f"{remote}:{base}/{name}"]
+        process = await create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+        out, _ = await process.communicate()
+        url = out.decode().strip()
+        return_code = await process.wait()
+        if return_code == 0:
+            buttons.url_buildbutton("Cloud Link 🔗", url)
             if isGdrive:
-                gid = await get_gid(drive, base, f"{name}/", conf)
-                if gid is not None:
-                    link = f"https://drive.google.com/folderview?id={gid[0]}"
-                    button.url_buildbutton('Cloud Link 🔗', link)
-                    await sendMarkup(f"{msg}\n\n<b>cc: </b>{self.__tag}", self.message, button.build_menu(1))
-                else:
-                    LOGGER.info("Gid not found")  
-            else:
-                await sendMessage(f"{msg}\n\n<b>cc: </b>{self.__tag}", self.message) 
+                add_index_link(name, type, buttons)
+            await sendMarkup(msg, self.message, buttons.build_menu(2))
         else:
             if isGdrive:
-                gid = await get_gid(drive, base, name, conf, False)
-                if gid is not None:
-                    link = f"https://drive.google.com/file/d/{gid[0]}/view"
-                    button.url_buildbutton('Cloud Link 🔗', link)
-                    await sendMarkup(f"{msg}\n\n<b>cc: </b>{self.__tag}", self.message, button.build_menu(1))
-                else:
-                    LOGGER.info("Gid not found")  
+                await get_drive_link(remote, base, name, conf, type, buttons)
+                add_index_link(name, type, buttons)
+                await sendMarkup(msg, self.message, buttons.build_menu(2))   
             else:
-                await sendMessage(f"{msg}\n\n<b>cc: </b>{self.__tag}", self.message)
-        clean_download(self.dir)
+                await sendMessage(msg, self.message)   
+        if self.__isMultiZip:
+            await clean_download(self.multizip_dir)
+        else:
+            if not config_dict['MULTI_REMOTE_UP']:
+                await clean_download(self.dir)
         async with status_dict_lock:
             try:
                 del status_dict[self.uid]
@@ -263,7 +355,7 @@ class MirrorLeechListener:
         msg += f'\n<b>Total Files: </b>{folders}'
         if typ != 0:
             msg += f'\n<b>Corrupted Files: </b>{typ}'
-        msg += f'\n<b>cc: </b>{self.__tag}\n\n'
+        msg += f'\n<b>cc: </b>{self.tag}\n\n'
         if not files:
             await sendMessage(msg, self.message)
         else:
@@ -276,7 +368,10 @@ class MirrorLeechListener:
                     fmsg = ''
             if fmsg != '':
                 await sendMessage(msg + fmsg, self.message)
-        clean_download(self.dir)
+        if self.__isMultiZip:
+            await clean_download(self.multizip_dir)
+        else:
+            await clean_download(self.dir)
         async with status_dict_lock:
             try:
                 del status_dict[self.uid]
@@ -290,14 +385,15 @@ class MirrorLeechListener:
 
     async def onDownloadError(self, error):
         error = error.replace('<', ' ').replace('>', ' ')
-        clean_download(self.dir)
+        if self.__isMultiZip:
+            await clean_download(self.multizip_dir)
+        else:
+            await clean_download(self.dir)
         async with status_dict_lock:
-            try:
+            if self.uid in status_dict.keys():
                 del status_dict[self.uid]
-            except Exception as e:
-                LOGGER.error(str(e))
             count = len(status_dict)
-        msg = f"{self.__tag} your download has been stopped due to: {error}"
+        msg = f"{self.tag} your download has been stopped due to: {error}"
         await sendMessage(msg, self.message)
         if count == 0:
             await self.clean()
@@ -306,14 +402,14 @@ class MirrorLeechListener:
 
     async def onUploadError(self, error):
         e_str = error.replace('<', '').replace('>', '')
-        clean_download(self.dir)
+        await clean_download(self.dir)
         async with status_dict_lock:
             try:
                 del status_dict[self.uid]
             except Exception as e:
                 LOGGER.error(str(e))
             count = len(status_dict)
-        await sendMessage(f"{self.__tag} {e_str}", self.message)
+        await sendMessage(f"{self.tag} {e_str}", self.message)
         if count == 0:
             await self.clean()
         else:

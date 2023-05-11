@@ -6,23 +6,22 @@ from bot.helper.mirror_leech_utils.status_utils.status_utils import MirrorStatus
 
 
 class RcloneStatus:
-    def __init__(self, obj, gid):
+    def __init__(self, obj, listener, gid):
         self.__obj = obj
         self.__gid = gid
         self.__percent= 0
         self.__speed= 0 
         self.__transfered_bytes = 0 
+        self.__blank= 0
         self.__eta= "-"
+        self.message = listener.message
         self.is_rclone= True
 
     async def read_stdout(self):
-        blank= 0
         while True:
-            data = await self.__obj.process.stdout.readline()
-            match = findall('Transferred:.*ETA.*', data.decode().strip())
-            if len(match) > 0:
-                nstr = match[0].replace('Transferred:', '')
-                self.info = nstr.strip().split(',')
+            data = (await self.__obj.process.stdout.readline()).decode()
+            if match:= findall('Transferred:.*ETA.*', data):
+                self.info = match[0].replace('Transferred:', '').strip().split(',')
                 self.__transfered_bytes = self.info[0]
                 try:
                     self.__percent = int(self.info[1].strip('% '))
@@ -30,12 +29,11 @@ class RcloneStatus:
                     pass
                 self.__speed = self.info[2]
                 self.__eta = self.info[3].replace('ETA', '') 
-            if len(match) == 0:
-                blank += 1
-                if blank == 15:
+                self.__blank = 0
+            if not match:
+                self.__blank += 1
+                if self.__blank == 15:
                     break
-            else:
-                blank = 0
             await sleep(0)
     
     def gid(self):

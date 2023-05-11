@@ -4,19 +4,20 @@
 from asyncio import sleep
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.filters import regex, command
-from bot import DOWNLOAD_DIR, bot
+from bot import DOWNLOAD_DIR, LOGGER, bot
 from re import split as re_split
 from bot.helper.ext_utils.bot_commands import BotCommands
-from bot.helper.ext_utils.bot_utils import is_url
+from bot.helper.ext_utils.bot_utils import is_url, run_sync
 from bot.helper.ext_utils.filters import CustomFilters
 from bot.helper.ext_utils.human_format import get_readable_file_size
 from bot.helper.ext_utils.message_utils import editMessage, sendMarkup, sendMessage
-from bot.helper.ext_utils.misc_utils import ButtonMaker
-from bot.helper.ext_utils.rclone_utils import is_rclone_config, is_rclone_drive
+from bot.helper.ext_utils.button_build import ButtonMaker
+from bot.helper.ext_utils.rclone_utils import is_rclone_config, is_remote_selected
 from bot.helper.mirror_leech_utils.download_utils.yt_dlp_helper import YoutubeDLHelper
-from bot.helper.mirror_leech_utils.listener import MirrorLeechListener
+from bot.modules.listener import MirrorLeechListener
 
 listener_dict = {}
+
 
 
 async def _ytdl(client, message, isZip= False, isLeech=False):
@@ -28,7 +29,7 @@ async def _ytdl(client, message, isZip= False, isLeech=False):
             pass
         else:
             return 
-        if await is_rclone_drive(user_id, message):
+        if await is_remote_selected(user_id, message):
             pass
         else:
             return
@@ -41,7 +42,9 @@ async def _ytdl(client, message, isZip= False, isLeech=False):
     if len(args) > 1:
         for x in args:
             x = x.strip()
-            if x.strip().isdigit():
+            if x in ['|', 'pswd:', 'opt:']:
+                break
+            elif x.strip().isdigit():
                 multi = int(x)
                 mi = index
         if multi == 0:
@@ -50,6 +53,9 @@ async def _ytdl(client, message, isZip= False, isLeech=False):
                 link = args[index].strip()
                 if link.startswith(("|", "pswd:", "opt:")):
                     link = ''
+                else:
+                    link = re_split(r"opt:|pswd:|\|", link)[0]
+                    link = link.strip() 
     
     name = mssg.split('|', maxsplit=1)
     if len(name) > 1:
@@ -95,16 +101,17 @@ Like playlist_items:10 works with string, so no need to add `^` before the numbe
 You can add tuple and dict also. Use double quotes inside dict.
 
 <b>NOTE:</b>
-You can add perfix randomly before link those for select (s) and mutli links (number).
-You can't add perfix randomly after link. They should be arranged like exmaple above, rename then pswd then opt. If you don't want to add pswd for example then it will be (|newname opt:), just don't change the arrangement.
-You can always add video quality from yt-dlp api options. 
+1. When use cmd by reply don't add any option in link msg! always add them after cmd msg!
+2. Mutli links (number)) can be add randomly before link or any other option.
+3. Options (rename, pswd, opt) should be arranged like exmaple above, rename then pswd then opt and after the link if link along with the cmd or after cmd if by reply. If you don't want to add pswd for example then it will be (|newname opt:), just don't change the arrangement.
+4. You can always add video quality from yt-dlp api options.
 """
         return await sendMessage(help_msg, message)
 
     listener = MirrorLeechListener(message, tag, user_id, isZip=isZip, pswd=pswd, isLeech=isLeech)
     ydl = YoutubeDLHelper(message)
     try:
-        result = ydl.extractMetaData(link, name, opt, True)
+        result = await run_sync(ydl.extractMetaData, link, name, opt, True)
     except Exception as e:
         msg = str(e).replace('<', ' ').replace('>', ' ')
         return await sendMessage(tag + " " + msg, message)
@@ -114,11 +121,11 @@ You can always add video quality from yt-dlp api options.
     formats_dict = {}
     if 'entries' in result:
         for i in ['144', '240', '360', '480', '720', '1080', '1440', '2160']:
-            video_format = f"bv*[height<={i}][ext=mp4]+ba[ext=m4a]/b[height<={i}]"
+            video_format = f"bv*[height<=?{i}][ext=mp4]+ba[ext=m4a]/b[height<=?{i}]"
             b_data = f"{i}|mp4"
             formats_dict[b_data] = video_format
             buttons.cb_buildbutton(f"{i}-mp4", f"qu {msg_id} {b_data} t")
-            video_format = f"bv*[height<={i}][ext=webm]+ba/b[height<={i}]"
+            video_format = f"bv*[height<=?{i}][ext=webm]+ba/b[height<=?{i}]"
             b_data = f"{i}|webm"
             formats_dict[b_data] = video_format
             buttons.cb_buildbutton(f"{i}-webm", f"qu {msg_id} {b_data} t")
@@ -131,7 +138,7 @@ You can always add video quality from yt-dlp api options.
         await sendMarkup('Choose Playlist Videos Quality:', message, YTBUTTONS)
     else:
         formats = result.get('formats')
-        formats_dict = {}
+        is_m4a = False
         if formats is not None:
             for frmt in formats:
                 if frmt.get('tbr'):
@@ -145,18 +152,21 @@ You can always add video quality from yt-dlp api options.
                     else:
                         size = 0
 
-                    if frmt.get('height'):
+                    if frmt.get('video_ext') == 'none' and frmt.get('acodec') != 'none':
+                        if frmt.get('audio_ext') == 'm4a':
+                            is_m4a = True
+                        b_name = f"{frmt['acodec']}-{frmt['ext']}"
+                        v_format = f"ba[format_id={format_id}]"
+                    elif frmt.get('height'):
                         height = frmt['height']
                         ext = frmt['ext']
                         fps = frmt['fps'] if frmt.get('fps') else ''
                         b_name = f"{height}p{fps}-{ext}"
                         if ext == 'mp4':
-                            v_format = f"bv*[format_id={format_id}]+ba[ext=m4a]/b[height={height}]"
+                            ba_ext = '[ext=m4a]' if is_m4a else ''
+                            v_format = f"bv*[format_id={format_id}]+ba{ba_ext}/b[height=?{height}]"
                         else:
-                            v_format = f"bv*[format_id={format_id}]+ba/b[height={height}]"
-                    elif frmt.get('video_ext') == 'none' and frmt.get('acodec') != 'none':
-                        b_name = f"{frmt['acodec']}-{frmt['ext']}"
-                        v_format = f"ba[format_id={format_id}]"
+                            v_format = f"bv*[format_id={format_id}]+ba/b[height=?{height}]"
                     else:
                         continue
 
@@ -179,9 +189,10 @@ You can always add video quality from yt-dlp api options.
         buttons.cb_buildbutton("Best Audio", f"qu {msg_id} {best_audio}")
         buttons.cb_buildbutton("Cancel", f"qu {msg_id} close")
         YTBUTTONS = buttons.build_menu(2)
-        listener_dict[msg_id] = [listener, user_id, link, name, YTBUTTONS, opt, formats_dict]
         await sendMarkup('Choose Video Quality:', message, YTBUTTONS)
 
+    listener_dict[msg_id] = [listener, user_id, link, name, YTBUTTONS, opt, formats_dict]
+    
     if multi > 1:
         await sleep(4)
         nextmsg = await client.get_messages(message.chat.id, message.reply_to_message.id + 1)
@@ -234,7 +245,8 @@ async def select_format(client, callback_query):
         return await editMessage("This is an old task", message)
     uid = task_info[1]
     if user_id != uid and not CustomFilters._owner_query(user_id):
-        return await query.answer(text="This task is not for you!", show_alert=True)
+        await query.answer(text="This task is not for you!", show_alert=True)
+        return
     elif data[2] == "dict":
         await query.answer()
         b_name = data[3]
@@ -242,9 +254,10 @@ async def select_format(client, callback_query):
         return
     elif data[2] == "back":
         await query.answer()
-        return await editMessage('Choose Video Quality:', message, task_info[3])
+        await editMessage('Choose Video Quality:', message, task_info[3])
+        return
     elif data[2] == "mp3":
-        query.answer()
+        await query.answer()
         playlist = len(data) == 4
         await _mp3_subbuttons(task_id, message, playlist)
         return
@@ -268,8 +281,12 @@ async def select_format(client, callback_query):
                 b_name, tbr = qual.split('|')
                 qual = task_info[6][b_name][tbr][1]
         ydl_hp = YoutubeDLHelper(listener)
+        LOGGER.info(f"Downloading with YT-DLP: {link}")
+        await message.delete()
+        del listener_dict[task_id]
         await ydl_hp.add_download(link, f'{DOWNLOAD_DIR}{task_id}', name, qual, playlist, opt)
-    del listener_dict[task_id]
+
+
 
 async def ytdlmirror(client, message):
     await _ytdl(client, message)
@@ -282,6 +299,7 @@ async def ytdlleech(client, message):
 
 async def ytdlzipleech(client, message):
     await _ytdl(client, message, isZip= True, isLeech=True)    
+
 
 ytdl_handler = MessageHandler(ytdlmirror, filters= command(BotCommands.YtdlMirrorCommand) & (CustomFilters.user_filter | CustomFilters.chat_filter))
 ytdl_leech_handler = MessageHandler(ytdlleech, filters= command(BotCommands.YtdlLeechCommand) & (CustomFilters.user_filter | CustomFilters.chat_filter))

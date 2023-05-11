@@ -1,13 +1,13 @@
 # Source: https://github.com/anasty17/mirror-leech-telegram-bot/blob/master/bot/modules/ytdlp.py
 # Adapted for asyncio framework and pyrogram library
 
+from functools import partial
 from logging import getLogger
 from random import SystemRandom
 from string import ascii_letters, digits
 from os import listdir, path as ospath
 from yt_dlp import YoutubeDL, DownloadError
 from re import search as re_search
-from json import loads as jsonloads
 from bot import status_dict_lock, status_dict, botloop
 from bot.helper.ext_utils.message_utils import sendStatusMessage
 from bot.helper.mirror_leech_utils.status_utils.yt_dlp_status import YtDlpDownloadStatus
@@ -118,7 +118,7 @@ class YoutubeDLHelper:
             self.__set_args(args)
         if get_info:
             self.opts['playlist_items'] = '0'
-        if link.startswith(('rtmp', 'mms', 'rstp')):
+        if link.startswith(('rtmp', 'mms', 'rstp', 'rtmps')):
             self.opts['external_downloader'] = 'ffmpeg'
         with YoutubeDL(self.opts) as ydl:
             try:
@@ -148,12 +148,12 @@ class YoutubeDLHelper:
         else:
             outtmpl_ ='%(title,fulltitle,alt_title)s%(season_number& |)s%(season_number&S|)s%(season_number|)02d%(episode_number&E|)s%(episode_number|)02d%(height& |)s%(height|)s%(height&p|)s%(fps|)s%(fps&fps|)s%(tbr& |)s%(tbr|)d.%(ext)s'
             realName = ydl.prepare_filename(result, outtmpl=outtmpl_)
-            ext = realName.rsplit('.', 1)[-1]
             if name == "":
-                newname = realName.split(f" [{result['id'].replace('*', '_')}]")
-                self.name = f'{newname[0]}.{ext}' if len(newname) > 1 else newname[0]
+                self.name = realName
             else:
+                ext = realName.rsplit('.', 1)[-1]
                 self.name = f"{name}.{ext}"
+
 
     async def __onDownloadStart(self):
         async with status_dict_lock:
@@ -172,8 +172,7 @@ class YoutubeDLHelper:
             rate = mp3_info[1]
             self.opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': rate}]
         self.opts['format'] = qual
-        LOGGER.info(f"Downloading with YT-DLP: {link}")
-        await botloop.run_in_executor(None, self.extractMetaData, link, name, args)
+        await botloop.run_in_executor(None, partial(self.extractMetaData, link, name, args))
         if self.is_cancelled:
             return
         if self.is_playlist:
@@ -204,11 +203,11 @@ class YoutubeDLHelper:
         except ValueError:
             await self.__onDownloadError("Download cancelled by user")
 
-    def cancel_download(self):
+    async def cancel_download(self):
         self.is_cancelled = True
         LOGGER.info(f"Cancelling Download: {self.name}")
         if not self.__downloading:
-            botloop.create_task(self.__onDownloadError("Download cancelled by user"))
+            await self.__onDownloadError("Download cancelled by user")
 
     def __set_args(self, args):
         args = args.split('|')
@@ -224,9 +223,6 @@ class YoutubeDLHelper:
                 varg = True
             elif varg.lower() == 'false':
                 varg = False
-            elif varg.startswith('(') and varg.endswith(')'):
-                varg = varg.replace('(', '').replace(')', '')
-                varg = tuple(map(int, varg.split(',')))
-            elif varg.startswith('{') and varg.endswith('}'):
-                varg = jsonloads(varg)
+            elif varg.startswith(('{', '[', '(')) and varg.endswith(('}', ']', ')')):
+                varg = eval(varg)
             self.opts[karg] = varg

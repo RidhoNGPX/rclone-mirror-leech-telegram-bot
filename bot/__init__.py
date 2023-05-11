@@ -1,42 +1,52 @@
-__version__ = "3.0"
+__version__ = "4.5"
 __author__ = "Sam-Max"
 
+from uvloop import install
+install()
 from asyncio import Lock
+from asyncio import Queue
+from socket import setdefaulttimeout
 from logging import getLogger, FileHandler, StreamHandler, INFO, basicConfig
-from os import environ, path as ospath
+from os import environ, remove as osremove, path as ospath, makedirs as osmakedirs
 from threading import Thread
 from time import sleep, time
 from sys import exit
 from dotenv import load_dotenv
+from pymongo import MongoClient
 from aria2p import API as ariaAPI, Client as ariaClient
 from qbittorrentapi import Client as qbitClient
 from subprocess import Popen, run as srun
-from megasdkrestclient import MegaSdkRestClient, errors
 from pyrogram import Client
 from bot.conv_pyrogram import Conversation
 from asyncio import get_event_loop
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from tzlocal import get_localzone
 
 botloop = get_event_loop()
+
+setdefaulttimeout(600)
+
+botUptime = time()
+
+LOGGER = getLogger(__name__)
+
+load_dotenv('config.env', override=True)
 
 basicConfig(level= INFO,
     format= "%(asctime)s %(levelname)s %(threadName)s %(name)s %(message)s",
     handlers=[StreamHandler(), FileHandler("botlog.txt")])
 
-LOGGER = getLogger(__name__)
-
-def getConfig(name: str):
-    return environ[name]
-
 def get_client():
     return qbitClient(host="localhost", port=8090)
 
-botUptime = time()
 Interval = []
 QbInterval = []
 GLOBAL_EXTENSION_FILTER = ['.aria2']
+user_data = {}
+leech_log = []
+remotes_multi= []
 aria2_options = {}
 qbit_options = {}
-DOWNLOAD_DIR = None
 
 status_dict_lock = Lock()
 status_reply_dict_lock = Lock()
@@ -53,12 +63,80 @@ status_reply_dict = {}
 # value: [rss_feed, last_link, last_title, filter]
 rss_dict = {}
 
-config_dict = {}
+m_queue = Queue()
+l_queue = Queue()
 
-AS_DOC_USERS = set()
-AS_MEDIA_USERS = set()
+BOT_TOKEN = environ.get('BOT_TOKEN', '')
+if len(BOT_TOKEN) == 0:
+    LOGGER.error("BOT_TOKEN variable is missing! Exiting now")
+    exit(1)
 
-load_dotenv('config.env')
+bot_id = BOT_TOKEN.split(':', 1)[0]
+
+DATABASE_URL = environ.get('DATABASE_URL', '')
+if len(DATABASE_URL) == 0:
+    DATABASE_URL = None
+
+if DATABASE_URL:
+    conn = MongoClient(DATABASE_URL)
+    db = conn.rcmltb
+    if config_dict := db.settings.config.find_one({'_id': bot_id}):  #return config dict (all env vars)
+        del config_dict['_id']
+        for key, value in config_dict.items():
+            environ[key] = str(value)
+    if pf_dict := db.settings.files.find_one({'_id': bot_id}):
+        del pf_dict['_id']
+        for key, value in pf_dict.items():
+            if value:
+                file_ = key.replace('__', '.')
+                file_name = ospath.basename(file_)
+                if file_name == "rclone.conf" and not ospath.exists(file_):
+                    osmakedirs(ospath.dirname(file_))
+                with open(file_, 'wb+') as f:
+                    f.write(value)
+    if a2c_options := db.settings.aria2c.find_one({'_id': bot_id}):
+        del a2c_options['_id']
+        aria2_options = a2c_options
+    if qbit_opt := db.settings.qbittorrent.find_one({'_id': bot_id}):
+        del qbit_opt['_id']
+        qbit_options = qbit_opt
+    conn.close()
+    BOT_TOKEN = environ.get('BOT_TOKEN', '')
+    bot_id = BOT_TOKEN.split(':', 1)[0]
+    DATABASE_URL = environ.get('DATABASE_URL', '')
+else:
+    config_dict = {}
+
+OWNER_ID = environ.get('OWNER_ID', '')
+if len(OWNER_ID) == 0:
+    LOGGER.error("OWNER_ID variable is missing! Exiting now")
+    exit(1)
+else:
+    OWNER_ID = int(OWNER_ID)
+
+TELEGRAM_API_ID = environ.get('TELEGRAM_API_ID', '')
+if len(TELEGRAM_API_ID) == 0:
+    LOGGER.error("TELEGRAM_API_ID variable is missing! Exiting now")
+    exit(1)
+else:
+    TELEGRAM_API_ID = int(TELEGRAM_API_ID)
+
+TELEGRAM_API_HASH = environ.get('TELEGRAM_API_HASH', '')
+if len(TELEGRAM_API_HASH) == 0:
+    LOGGER.error("TELEGRAM_API_HASH variable is missing! Exiting now")
+    exit(1)
+
+ALLOWED_CHATS = environ.get('ALLOWED_CHATS', '')
+if len(ALLOWED_CHATS) != 0:
+    aid = ALLOWED_CHATS.split()
+    for id_ in aid:
+        user_data[int(id_.strip())] = {'is_auth': True}
+
+SUDO_USERS = environ.get('SUDO_USERS', '')
+if len(SUDO_USERS) != 0:
+    aid = SUDO_USERS.split()
+    for id_ in aid:
+        user_data[int(id_.strip())] = {'is_sudo': True}
 
 STATUS_LIMIT = environ.get('STATUS_LIMIT', '')
 STATUS_LIMIT = '' if len(STATUS_LIMIT) == 0 else int(STATUS_LIMIT)
@@ -69,14 +147,23 @@ if len(STATUS_UPDATE_INTERVAL) == 0:
 else:
     STATUS_UPDATE_INTERVAL = int(STATUS_UPDATE_INTERVAL)
 
+AUTO_DELETE_MESSAGE_DURATION = environ.get('AUTO_DELETE_MESSAGE_DURATION', '')
+if len(AUTO_DELETE_MESSAGE_DURATION) == 0:
+    AUTO_DELETE_MESSAGE_DURATION = 30
+else:
+    AUTO_DELETE_MESSAGE_DURATION = int(AUTO_DELETE_MESSAGE_DURATION)
+
+PARALLEL_TASKS = environ.get('PARALLEL_TASKS', '')
+PARALLEL_TASKS = "" if len(PARALLEL_TASKS) == 0 else int(PARALLEL_TASKS)
+
 AS_DOCUMENT = environ.get('AS_DOCUMENT', '')
 AS_DOCUMENT = AS_DOCUMENT.lower() == 'true'
 
 AUTO_MIRROR= environ.get('AUTO_MIRROR', '')  
 AUTO_MIRROR= AUTO_MIRROR.lower() == 'true'
 
-DUMP_CHAT = environ.get('DUMP_CHAT', '')
-DUMP_CHAT= '' if len(DUMP_CHAT) == 0 else int(DUMP_CHAT)
+MULTI_REMOTE_UP= environ.get('MULTI_REMOTE_UP', '')  
+MULTI_REMOTE_UP= MULTI_REMOTE_UP.lower() == 'true'
 
 UPTOBOX_TOKEN = environ.get('UPTOBOX_TOKEN', '')
 if len(UPTOBOX_TOKEN) == 0:
@@ -102,19 +189,31 @@ WEB_PINCODE = WEB_PINCODE.lower() == 'true'
 EQUAL_SPLITS = environ.get('EQUAL_SPLITS', '')
 EQUAL_SPLITS = EQUAL_SPLITS.lower() == 'true'
 
-DEFAULT_REMOTE = environ.get('DEFAULT_REMOTE', '')
+DEFAULT_OWNER_REMOTE = environ.get('DEFAULT_OWNER_REMOTE', '')
 
-SERVE_USER = environ.get('SERVE_USER', '')
-SERVE_USER = 'admin' if len(SERVE_USER) == 0 else SERVE_USER
+DEFAULT_GLOBAL_REMOTE = environ.get('DEFAULT_GLOBAL_REMOTE', '')
 
-SERVE_PASS= environ.get('SERVE_PASS', '')
-SERVE_PASS = 'admin' if len(SERVE_PASS) == 0 else SERVE_PASS
+GD_INDEX_URL = environ.get('GD_INDEX_URL', '').rstrip("/")
+if len(GD_INDEX_URL) == 0:
+    GD_INDEX_URL = ''
 
-SERVE_IP = environ.get('SERVE_IP', '')
-SERVE_IP = '' if len(SERVE_IP) == 0 else SERVE_IP
+VIEW_LINK = environ.get('VIEW_LINK', '')
+VIEW_LINK = VIEW_LINK.lower() == 'true'
 
-SERVE_PORT = environ.get('SERVE_PORT', '')
-SERVE_PORT= 8080 if len(SERVE_PORT) == 0 else int(SERVE_PORT)
+LOCAL_MIRROR = environ.get('LOCAL_MIRROR', '')
+LOCAL_MIRROR = LOCAL_MIRROR.lower() == 'true'
+
+RC_INDEX_USER = environ.get('RC_INDEX_USER', '')
+RC_INDEX_USER = 'admin' if len(RC_INDEX_USER) == 0 else RC_INDEX_USER
+
+RC_INDEX_PASS= environ.get('RC_INDEX_PASS', '')
+RC_INDEX_PASS = 'admin' if len(RC_INDEX_PASS) == 0 else RC_INDEX_PASS
+
+RC_INDEX_URL = environ.get('RC_INDEX_URL', '')
+RC_INDEX_URL = '' if len(RC_INDEX_URL) == 0 else RC_INDEX_URL
+
+RC_INDEX_PORT = environ.get('RC_INDEX_PORT', '')
+RC_INDEX_PORT= 8080 if len(RC_INDEX_PORT) == 0 else int(RC_INDEX_PORT)
 
 USE_SERVICE_ACCOUNTS = environ.get('USE_SERVICE_ACCOUNTS', '')
 USE_SERVICE_ACCOUNTS = USE_SERVICE_ACCOUNTS.lower() == 'true'
@@ -124,28 +223,25 @@ SERVICE_ACCOUNTS_REMOTE = environ.get('SERVICE_ACCOUNTS_REMOTE', '')
 MULTI_RCLONE_CONFIG = environ.get('MULTI_RCLONE_CONFIG', '')
 MULTI_RCLONE_CONFIG = MULTI_RCLONE_CONFIG.lower() == 'true' 
 
-SERVER_SIDE_COPY = environ.get('SERVER_SIDE_COPY', '')
-SERVER_SIDE_COPY = SERVER_SIDE_COPY.lower() == 'true' 
+REMOTE_SELECTION = environ.get('REMOTE_SELECTION', '')
+REMOTE_SELECTION = REMOTE_SELECTION.lower() == 'true'
 
-aid = environ.get('ALLOWED_CHATS', '')
-if len(aid) != 0:
-    aid = aid.split()
-    ALLOWED_CHATS = {int(_id.strip()) for _id in aid}
-else:
-    ALLOWED_CHATS= set()
+RCLONE_COPY_FLAGS = environ.get('RCLONE_COPY_FLAGS', '')
+if len(RCLONE_COPY_FLAGS) == 0:
+    RCLONE_COPY_FLAGS = ''
 
-aid = environ.get('SUDO_USERS', '')
-if len(aid) != 0:
-    aid = aid.split()
-    SUDO_USERS = {int(_id.strip()) for _id in aid}
-else:
-    SUDO_USERS = set()
+RCLONE_UPLOAD_FLAGS = environ.get('RCLONE_UPLOAD_FLAGS', '')
+if len(RCLONE_UPLOAD_FLAGS) == 0:
+    RCLONE_UPLOAD_FLAGS = ''
+
+RCLONE_DOWNLOAD_FLAGS = environ.get('RCLONE_DOWNLOAD_FLAGS', '')
+if len(RCLONE_DOWNLOAD_FLAGS) == 0:
+    RCLONE_DOWNLOAD_FLAGS = ''
+
+SERVER_SIDE = environ.get('SERVER_SIDE', '')
+SERVER_SIDE = SERVER_SIDE.lower() == 'true' 
 
 CMD_INDEX = environ.get('CMD_INDEX', '')
-
-DB_URI = environ.get('DATABASE_URL', '')
-if len(DB_URI) == 0:
-    DB_URI = None
 
 RSS_CHAT_ID = environ.get('RSS_CHAT_ID', '')
 RSS_CHAT_ID = '' if len(RSS_CHAT_ID) == 0 else int(RSS_CHAT_ID)
@@ -157,14 +253,23 @@ RSS_COMMAND = environ.get('RSS_COMMAND', '')
 if len(RSS_COMMAND) == 0:
     RSS_COMMAND = ''
 
-BASE_URL = environ.get('BASE_URL', '').rstrip("/")
-if len(BASE_URL) == 0:
-    LOGGER.warning('BASE_URL not provided!')
-    BASE_URL = ''
+LOCAL_MIRROR_URL = environ.get('LOCAL_MIRROR_URL', '').rstrip("/")
+if len(LOCAL_MIRROR_URL) == 0:
+    LOGGER.warning('LOCAL_MIRROR_URL not provided!')
+    LOCAL_MIRROR_URL = ''
 
-SERVER_PORT = environ.get('SERVER_PORT', '')
-if len(SERVER_PORT) == 0:
-    SERVER_PORT = 80
+LOCAL_MIRROR_PORT = environ.get('LOCAL_MIRROR_PORT', '')
+if len(LOCAL_MIRROR_PORT) == 0:
+    LOCAL_MIRROR_PORT = 81
+
+QB_BASE_URL = environ.get('QB_BASE_URL', '').rstrip("/")
+if len(QB_BASE_URL) == 0:
+    LOGGER.warning('QB_BASE_URL not provided!')
+    QB_BASE_URL = '' 
+
+QB_SERVER_PORT = environ.get('QB_SERVER_PORT', '')
+if len(QB_SERVER_PORT) == 0:
+    QB_SERVER_PORT = 80
 
 UPSTREAM_REPO = environ.get('UPSTREAM_REPO', '')
 if len(UPSTREAM_REPO) == 0:
@@ -184,27 +289,8 @@ if len(GDRIVE_FOLDER_ID) == 0:
 DOWNLOAD_DIR = environ.get('DOWNLOAD_DIR', '')
 if len(DOWNLOAD_DIR) == 0:
     DOWNLOAD_DIR = '/usr/src/app/downloads/'
-else:
-    if not DOWNLOAD_DIR.endswith("/"):
-        DOWNLOAD_DIR = DOWNLOAD_DIR + '/'
-
-Popen(f"gunicorn web.wserver:app --bind 0.0.0.0:{SERVER_PORT}", shell=True)
-srun(["qbittorrent-nox", "-d", "--profile=."])
-if not ospath.exists('.netrc'):
-    srun(["touch", ".netrc"])
-srun(["cp", ".netrc", "/root/.netrc"])
-srun(["chmod", "600", ".netrc"])
-srun(["chmod", "+x", "aria.sh"])
-srun("./aria.sh", shell=True)
-sleep(0.5)
-
-aria2 = ariaAPI(
-    ariaClient(
-        host="http://localhost",
-        port=6800,
-        secret="",
-    )
-)
+elif not DOWNLOAD_DIR.endswith("/"):
+    DOWNLOAD_DIR = f'{DOWNLOAD_DIR}/'
 
 EXTENSION_FILTER = environ.get('EXTENSION_FILTER', '')
 if len(EXTENSION_FILTER) > 0:
@@ -212,31 +298,6 @@ if len(EXTENSION_FILTER) > 0:
     for x in fx:
         GLOBAL_EXTENSION_FILTER.append(x.strip().lower())
 
-try:
-    TELEGRAM_API_ID = int(getConfig("TELEGRAM_API_ID"))
-    TELEGRAM_API_HASH = getConfig("TELEGRAM_API_HASH")
-    BOT_TOKEN = getConfig("BOT_TOKEN")
-    OWNER_ID= int(getConfig('OWNER_ID'))
-except:
-    LOGGER.error("One or more env variables missing! Exiting now")
-    exit(1)
-
-def aria2c_init():
-    try:
-        LOGGER.info("Initializing Aria2c")
-        link = "https://linuxmint.com/torrents/lmde-5-cinnamon-64bit.iso.torrent"
-        dire = DOWNLOAD_DIR.rstrip("/")
-        aria2.add_uris([link], {'dir': dire})
-        sleep(3)
-        downloads = aria2.get_downloads()
-        sleep(20)
-        for download in downloads:
-            aria2.remove([download], force=True, files=True)
-    except Exception as e:
-        LOGGER.error(f"Aria2c initializing error: {e}")
-Thread(target=aria2c_init).start()
-sleep(1.5)
-    
 MEGA_API_KEY = environ.get('MEGA_API_KEY', '')
 if len(MEGA_API_KEY) == 0:
     LOGGER.warning('MEGA_API_KEY not provided!')
@@ -249,36 +310,32 @@ if len(MEGA_EMAIL_ID) == 0 or len(MEGA_PASSWORD) == 0:
     MEGA_EMAIL_ID = ''
     MEGA_PASSWORD = ''
 
-if len(MEGA_API_KEY) > 0:
-    Popen(["megasdkrest", "--apikey", MEGA_API_KEY])
-    sleep(3)
-    mega_client = MegaSdkRestClient('http://localhost:6090')
-    try:
-        if len(MEGA_EMAIL_ID) > 0 and len(MEGA_PASSWORD) > 0:
-            try:
-                mega_client.login(MEGA_EMAIL_ID, MEGA_PASSWORD)
-            except errors.MegaSdkRestClientException as e:
-                LOGGER.error(e.message['message'])
-                exit(0)
-        else:
-            LOGGER.info("Mega username and password not provided. Starting mega in anonymous mode!")
-    except:
-            LOGGER.info("Mega username and password not provided. Starting mega in anonymous mode!")
-else:
-    sleep(1.5)
+LEECH_LOG = environ.get('LEECH_LOG', '')
+if len(LEECH_LOG) != 0:
+    leech_log.clear()
+    aid = LEECH_LOG.split()
+    for id_ in aid:
+        leech_log.append(int(id_.strip()))
 
-#---------------------------
+BOT_PM = environ.get('BOT_PM', '')
+BOT_PM = BOT_PM.lower() == 'true'
 
-bot = Client(name="pyrogram", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=BOT_TOKEN)
+bot = Client(name="pyrogram", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, bot_token=BOT_TOKEN, max_concurrent_transmissions=10)
 Conversation(bot) 
-try:
-    bot.start()
-    LOGGER.info("Pyrogram client created")
-except Exception as e:
-    print(e)
-    exit(1)
+LOGGER.info("Creating Pyrogram client")
 
-#---------------------------
+IS_PREMIUM_USER = False
+USER_SESSION_STRING = environ.get('USER_SESSION_STRING', '')
+app= None
+if len(USER_SESSION_STRING) != 0:
+    LOGGER.info("Creating Pyrogram client from USER_SESSION_STRING")
+    app = Client(name="pyrogram_session", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, session_string=USER_SESSION_STRING, no_updates=True, max_concurrent_transmissions=10)
+    with app:
+        if IS_PREMIUM_USER := app.me.is_premium:
+            if not LEECH_LOG:
+                LOGGER.error("You must set LEECH_LOG for uploads. Exiting Now...")
+                app.stop()
+                exit(1)
 
 RSS_USER_SESSION_STRING = environ.get('RSS_USER_SESSION_STRING', '')
 if len(RSS_USER_SESSION_STRING) == 0:
@@ -286,24 +343,6 @@ if len(RSS_USER_SESSION_STRING) == 0:
 else:
     LOGGER.info("Creating client from RSS_USER_SESSION_STRING")
     rss_session = Client(name='rss_session', api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, session_string=RSS_USER_SESSION_STRING, no_updates=True)
-
-#---------------------------
-IS_PREMIUM_USER = False
-USER_SESSION_STRING = environ.get('USER_SESSION_STRING', '')
-if len(USER_SESSION_STRING) == 0:
-    app = None
-else:
-    LOGGER.info("Pyrogram client created from USER_SESSION_STRING")
-    app = Client(name="pyrogram_session", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH, session_string=USER_SESSION_STRING)
-    with app:
-        IS_PREMIUM_USER = app.me.is_premium
-
-if app is not None:
-    try:
-        app.start()
-    except Exception as e:
-        print(e)
-        exit(1)
 
 TG_MAX_FILE_SIZE= 4194304000 if IS_PREMIUM_USER else 2097152000
 LEECH_SPLIT_SIZE = environ.get('LEECH_SPLIT_SIZE', '')
@@ -315,29 +354,51 @@ else:
 if not config_dict:
     config_dict = {'AS_DOCUMENT': AS_DOCUMENT,
                    'ALLOWED_CHATS': ALLOWED_CHATS,
+                   'AUTO_DELETE_MESSAGE_DURATION': AUTO_DELETE_MESSAGE_DURATION,
                    'AUTO_MIRROR': AUTO_MIRROR,
-                   'BASE_URL': BASE_URL,
+                   'LOCAL_MIRROR_URL': LOCAL_MIRROR_URL,
+                   'BOT_TOKEN': BOT_TOKEN,
+                   'BOT_PM': BOT_PM,
                    'CMD_INDEX': CMD_INDEX,
-                   'DUMP_CHAT': DUMP_CHAT,
-                   'DEFAULT_REMOTE': DEFAULT_REMOTE,
+                   'DATABASE_URL': DATABASE_URL,
+                   'DEFAULT_OWNER_REMOTE': DEFAULT_OWNER_REMOTE,
+                   'DEFAULT_GLOBAL_REMOTE':DEFAULT_GLOBAL_REMOTE,
+                   'DOWNLOAD_DIR':DOWNLOAD_DIR,
                    'EQUAL_SPLITS': EQUAL_SPLITS,
                    'EXTENSION_FILTER': EXTENSION_FILTER,
                    'GDRIVE_FOLDER_ID': GDRIVE_FOLDER_ID,
                    'IS_TEAM_DRIVE': IS_TEAM_DRIVE,
+                   'GD_INDEX_URL': GD_INDEX_URL,
+                   'LOCAL_MIRROR': LOCAL_MIRROR,
                    'LEECH_SPLIT_SIZE': LEECH_SPLIT_SIZE,
+                   'LEECH_LOG': LEECH_LOG,
                    'MEGA_API_KEY': MEGA_API_KEY,
                    'MEGA_EMAIL_ID': MEGA_EMAIL_ID,
                    'MEGA_PASSWORD': MEGA_PASSWORD,
+                   'MULTI_REMOTE_UP': MULTI_REMOTE_UP,
                    'MULTI_RCLONE_CONFIG': MULTI_RCLONE_CONFIG, 
-                   'SERVER_SIDE_COPY': SERVER_SIDE_COPY,
+                   'OWNER_ID': OWNER_ID,
+                   'PARALLEL_TASKS': PARALLEL_TASKS,
+                   'QB_BASE_URL': QB_BASE_URL,
+                   'QB_SERVER_PORT': QB_SERVER_PORT,
+                   'RCLONE_COPY_FLAGS': RCLONE_COPY_FLAGS,
+                   'RCLONE_UPLOAD_FLAGS': RCLONE_UPLOAD_FLAGS,
+                   'RCLONE_DOWNLOAD_FLAGS': RCLONE_DOWNLOAD_FLAGS,
+                   'REMOTE_SELECTION': REMOTE_SELECTION,
                    'RSS_USER_SESSION_STRING': RSS_USER_SESSION_STRING,
                    'RSS_CHAT_ID': RSS_CHAT_ID,
                    'RSS_COMMAND': RSS_COMMAND,
                    'RSS_DELAY': RSS_DELAY,
+                   'SEARCH_PLUGINS': SEARCH_PLUGINS,
+                   'SERVER_SIDE': SERVER_SIDE,
                    'SEARCH_API_LINK': SEARCH_API_LINK,
                    'SEARCH_LIMIT': SEARCH_LIMIT,
-                   'SERVER_PORT': SERVER_PORT,
+                   'LOCAL_MIRROR_PORT': LOCAL_MIRROR_PORT,
                    'SERVICE_ACCOUNTS_REMOTE': SERVICE_ACCOUNTS_REMOTE,
+                   'RC_INDEX_URL': RC_INDEX_URL,
+                   'RC_INDEX_PORT': RC_INDEX_PORT,
+                   'RC_INDEX_USER':RC_INDEX_USER,
+                   'RC_INDEX_PASS': RC_INDEX_PASS,
                    'STATUS_LIMIT': STATUS_LIMIT,
                    'STATUS_UPDATE_INTERVAL': STATUS_UPDATE_INTERVAL,
                    'SUDO_USERS': SUDO_USERS,
@@ -349,8 +410,50 @@ if not config_dict:
                    'UPTOBOX_TOKEN': UPTOBOX_TOKEN,
                    'USER_SESSION_STRING': USER_SESSION_STRING,
                    'USE_SERVICE_ACCOUNTS': USE_SERVICE_ACCOUNTS,
+                   'VIEW_LINK': VIEW_LINK,
                    'WEB_PINCODE': WEB_PINCODE}
 
+if LOCAL_MIRROR:
+    Popen(f"gunicorn web.wserver:app --bind 0.0.0.0:{LOCAL_MIRROR_PORT}", shell=True)
+Popen(f"gunicorn qbitweb.wserver:app --bind 0.0.0.0:{QB_SERVER_PORT}", shell=True)
+srun(["qbittorrent-nox", "-d", "--profile=."])
+
+if not ospath.exists('.netrc'):
+    srun(["touch", ".netrc"])
+srun(["chmod", "600", ".netrc"])    
+srun(["cp", ".netrc", "/root/.netrc"])
+srun(["chmod", "+x", "aria.sh"])
+srun("./aria.sh", shell=True)
+sleep(0.5)
+
+if ospath.exists('accounts.zip'):
+    if ospath.exists('accounts'):
+        srun(["rm", "-rf", "accounts"])
+    srun(["7z", "x", "-o.", "-aoa", "accounts.zip", "accounts/*.json"])
+    srun(["chmod", "-R", "777", "accounts"])
+    osremove('accounts.zip')
+
+if not ospath.exists('accounts'):
+    config_dict['USE_SERVICE_ACCOUNTS'] = False
+
+aria2 = ariaAPI(ariaClient(host="http://localhost", port=6800, secret=""))
+
+def aria2c_init():
+    try:
+        LOGGER.info("Initializing Aria2c")
+        link = "https://linuxmint.com/torrents/lmde-5-cinnamon-64bit.iso.torrent"
+        dire = DOWNLOAD_DIR.rstrip("/")
+        aria2.add_uris([link], {'dir': dire})
+        sleep(3)
+        downloads = aria2.get_downloads()
+        sleep(15)
+        for download in downloads:
+            aria2.remove([download], force=True, files=True)
+    except Exception as e:
+        LOGGER.error(f"Aria2c initializing error: {e}")
+Thread(target=aria2c_init).start()
+sleep(1.5)
+    
 aria2c_global = ['bt-max-open-files', 'download-result', 'keep-unfinished-download-result', 'log', 'log-level',
                  'max-concurrent-downloads', 'max-download-result', 'max-overall-download-limit', 'save-session',
                  'max-overall-upload-limit', 'optimize-concurrent-downloads', 'save-cookies', 'server-stat-of']
@@ -360,10 +463,25 @@ if not aria2_options:
     del aria2_options['dir']
     del aria2_options['max-download-limit']
     del aria2_options['lowest-speed-limit']
-
+else:
+    a2c_glo = {}
+    for op in aria2c_global:
+        if op in aria2_options:
+            a2c_glo[op] = aria2_options[op]
+    aria2.set_global_options(a2c_glo)
+   
 qb_client = get_client()
 if not qbit_options:
     qbit_options = dict(qb_client.app_preferences())
-    del qbit_options['scan_dirs']
+    del qbit_options['listen_port']
+    for k in list(qbit_options.keys()):
+        if k.startswith('rss'):
+            del qbit_options[k]
 else:
-    qb_client.app_set_preferences(qbit_options)
+    qb_opt = {**qbit_options}
+    for k, v in list(qb_opt.items()):
+        if v in ["", "*"]:
+            del qb_opt[k]
+    qb_client.app_set_preferences(qb_opt)
+
+scheduler = AsyncIOScheduler(timezone=str(get_localzone()), event_loop=botloop)

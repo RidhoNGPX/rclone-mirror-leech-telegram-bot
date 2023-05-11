@@ -4,8 +4,7 @@
 from io import FileIO
 from logging import getLogger, ERROR
 from time import time
-from pickle import load as pload
-from json import loads as jsnloads
+from pickle import load as pload, dump as pdump
 from os import makedirs, path as ospath
 from re import search as re_search
 from urllib.parse import parse_qs, urlparse
@@ -14,8 +13,9 @@ from googleapiclient.errors import HttpError, Error as GCError
 from googleapiclient.http import MediaIoBaseDownload
 from bot import GLOBAL_EXTENSION_FILTER, config_dict, botloop
 from bot.helper.ext_utils.bot_utils import setInterval
+from google.auth.transport.requests import Request
 from bot.helper.ext_utils.human_format import get_readable_file_size
-from bot.helper.ext_utils.misc_utils import ButtonMaker
+from bot.helper.ext_utils.button_build import ButtonMaker
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, RetryError
 
 LOGGER = getLogger(__name__)
@@ -67,8 +67,14 @@ class GoogleDriveHelper:
         # Get credentials
         credentials = None
         if ospath.exists(self.__G_DRIVE_TOKEN_FILE):
+            LOGGER.info("Authorize with token.pickle")
             with open(self.__G_DRIVE_TOKEN_FILE, 'rb') as f:
                 credentials = pload(f)
+            if credentials and not credentials.valid and credentials.expired and credentials.refresh_token:
+                LOGGER.warning('Your token is expired! Refreshing Token...')
+                credentials.refresh(Request())
+                with open(self.__G_DRIVE_TOKEN_FILE, 'wb') as token:
+                    pdump(credentials, token)
         else:
             LOGGER.error('token.pickle not found!')
         return build('drive', 'v3', credentials=credentials, cache_discovery=False)
@@ -236,7 +242,7 @@ class GoogleDriveHelper:
             return self.__service.files().copy(fileId=file_id, body=body, supportsTeamDrives=True).execute()
         except HttpError as err:
             if err.resp.get('content-type', '').startswith('application/json'):
-                reason = jsnloads(err.content).get('error').get('errors')[0].get('reason')
+                reason = eval(err.content).get('error').get('errors')[0].get('reason')
                 if reason in ['userRateLimitExceeded', 'dailyLimitExceeded']:
                     self.__is_cancelled  = True
                     LOGGER.error(f"Got: {reason}")
@@ -302,7 +308,7 @@ class GoogleDriveHelper:
             if meta.get("mimeType") == self.__G_DRIVE_DIR_MIME_TYPE:
                 await botloop.run_in_executor(None, self.__download_folder, file_id, self.__path, self.name)
             else:
-                makedirs(self.__path)
+                makedirs(self.__path, exist_ok=True)
                 await botloop.run_in_executor(None, self.__download_file, file_id, self.__path, self.name, meta.get('mimeType'))
         except Exception as err:
             if isinstance(err, RetryError):
@@ -360,6 +366,8 @@ class GoogleDriveHelper:
             filename = f"{filename[:245]}{ext}"
             if self.name.endswith(ext):
                 self.name = filename
+        if self.__is_cancelled:
+            return
         fh = FileIO(f"{path}/{filename}", 'wb')
         downloader = MediaIoBaseDownload(fh, request, chunksize=50 * 1024 * 1024)
         done = False
@@ -371,7 +379,7 @@ class GoogleDriveHelper:
                 self.__status, done = downloader.next_chunk()
             except HttpError as err:
                 if err.resp.get('content-type', '').startswith('application/json'):
-                    reason = jsnloads(err.content).get('error').get('errors')[0].get('reason')
+                    reason = eval(err.content).get('error').get('errors')[0].get('reason')
                     if reason not in [
                         'downloadQuotaExceeded',
                         'dailyLimitExceeded',
@@ -415,10 +423,10 @@ class GoogleDriveHelper:
             return msg, "", "", ""
         return "", size, name, files
 
-    def cancel_download(self):
+    async def cancel_download(self):
         self.__is_cancelled = True
         if self.__is_downloading:
             LOGGER.info(f"Cancelling Download: {self.name}")
-            botloop.create_task(self.__listener.onDownloadError('Download stopped by user!'))
+            await self.__listener.onDownloadError('Download stopped by user!')
         else:
             LOGGER.info(f"Cancelling Clone: {self.name}")

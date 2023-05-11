@@ -1,10 +1,12 @@
 from time import time
-from bot import bot, status_dict, status_dict_lock, LOGGER
-from bot.helper.ext_utils.message_utils import sendStatusMessage
+from bot import IS_PREMIUM_USER, bot, app, status_dict, status_dict_lock, LOGGER
+from bot.helper.ext_utils.message_utils import sendStatusMessage, update_all_messages
 from bot.helper.mirror_leech_utils.status_utils.tg_download_status import TelegramStatus
 
+
+
 class TelegramDownloader:
-    def __init__(self, file, client, listener, path, name) -> None:
+    def __init__(self, file, client, listener, path, name, multi=0, multi_zip=False):
         self.__client= client
         self.__listener = listener
         self.name = name
@@ -15,6 +17,8 @@ class TelegramDownloader:
         self.__file = file
         self.__path= path
         self.__start_time = time()
+        self.__multi= multi
+        self.__multi_zip= multi_zip
         self.__is_cancelled = False
 
     @property
@@ -27,25 +31,36 @@ class TelegramDownloader:
         self.gid = file_id
         async with status_dict_lock:
             status_dict[self.__listener.uid] = TelegramStatus(self, self.__listener.message, self.gid)
-        self.__listener.onDownloadStart()
         await sendStatusMessage(self.__listener.message)
 
     async def onDownloadProgress(self, current, total):
         if self.__is_cancelled:
-            bot.stop_transmission()
+            if IS_PREMIUM_USER:
+                app.stop_transmission()
+            else:
+                bot.stop_transmission()
             return
         self.downloaded_bytes = current
         try:
             self.progress = current / self.size * 100
-        except ZeroDivisionError:
+        except:
             pass
 
     async def download(self):
-        if self.name == "":
-            name = self.__file.file_name
+        if self.__file == None:
+            return
+        if self.__multi_zip:
+            if self.name == "":
+                name = "multizip"
+            else:
+                name = self.name
+            self.__path= self.__path
         else:
-            name = self.name
-            self.__path =  self.__path + name
+            if self.name == "":
+                name = self.__file.file_name if hasattr(self.__file, 'file_name') else 'None'
+            else:
+                name = self.name
+                self.__path = self.__path + name
         size = self.__file.file_size   
         gid = self.__file.file_unique_id
         await self.__onDownloadStart(name, size, gid)
@@ -56,16 +71,29 @@ class TelegramDownloader:
                 file_name= self.__path,
                 progress= self.onDownloadProgress)
             if self.__is_cancelled:
-                await self.__onDownloadError("Cancelled by user")
-            if download is not None:
-                await self.__listener.onDownloadComplete()
+                await self.__onDownloadError("Cancelled by user!")
+                return
         except Exception as e:
+            LOGGER.error(str(e))
             await self.__onDownloadError(str(e))
-
+            return
+        if download is not None:
+            if self.__multi_zip:
+                if self.__multi == 1:
+                    await self.__listener.onMultiZipComplete()
+                else:
+                    async with status_dict_lock:
+                        del status_dict[self.__listener.uid]
+                    await update_all_messages()
+            else:
+                await self.__listener.onDownloadComplete()
+        elif not self.__is_cancelled:
+            await self.__onDownloadError('Internal error occurred')
+        
     async def __onDownloadError(self, error):
         await self.__listener.onDownloadError(error) 
 
-    def cancel_download(self):
+    async def cancel_download(self):
         LOGGER.info(f'Cancelling download by user request')
         self.__is_cancelled = True
 
