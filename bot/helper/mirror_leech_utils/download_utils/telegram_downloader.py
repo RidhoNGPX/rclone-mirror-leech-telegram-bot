@@ -1,6 +1,6 @@
 from time import time
-from bot import IS_PREMIUM_USER, bot, app, status_dict, status_dict_lock, LOGGER
-from bot.helper.ext_utils.message_utils import sendStatusMessage, update_all_messages
+from bot import IS_PREMIUM_USER, bot, app, status_dict, config_dict, status_dict_lock, LOGGER
+from bot.helper.telegram_helper.message_utils import sendStatusMessage, update_all_messages
 from bot.helper.mirror_leech_utils.status_utils.tg_download_status import TelegramStatus
 
 
@@ -30,8 +30,10 @@ class TelegramDownloader:
         self.size = size
         self.gid = file_id
         async with status_dict_lock:
-            status_dict[self.__listener.uid] = TelegramStatus(self, self.__listener.message, self.gid)
+            status_dict[self.__listener.uid] = TelegramStatus(self, size, self.__listener.message, self.gid)
         await sendStatusMessage(self.__listener.message)
+        if not config_dict['NO_TASKS_LOGS']:
+            LOGGER.info(f'Download from Telegram: {name}')
 
     async def onDownloadProgress(self, current, total):
         if self.__is_cancelled:
@@ -64,7 +66,6 @@ class TelegramDownloader:
         size = self.__file.file_size   
         gid = self.__file.file_unique_id
         await self.__onDownloadStart(name, size, gid)
-        LOGGER.info(f'Downloading Telegram file with id: {gid}')
         try:
             download= await self.__client.download_media(
                 message= self.__file,
